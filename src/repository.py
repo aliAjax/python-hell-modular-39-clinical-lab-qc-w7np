@@ -17,6 +17,7 @@ class SQLiteRepository:
     def _connect(self):
         connection = sqlite3.connect(self.path, timeout=30)
         connection.row_factory = sqlite3.Row
+        connection.execute("PRAGMA busy_timeout=30000")
         return connection
 
     def _initialize(self):
@@ -51,10 +52,19 @@ class SQLiteRepository:
                     actor_id TEXT NOT NULL,
                     idem_key TEXT NOT NULL,
                     entity_id TEXT NOT NULL,
+                    action TEXT NOT NULL DEFAULT 'create',
                     created_at TEXT NOT NULL,
                     PRIMARY KEY(actor_id, idem_key)
                 );
             """)
+            columns = {
+                row["name"]
+                for row in connection.execute("PRAGMA table_info(idempotency)").fetchall()
+            }
+            if "action" not in columns:
+                connection.execute(
+                    "ALTER TABLE idempotency ADD COLUMN action TEXT NOT NULL DEFAULT 'create'"
+                )
 
     @staticmethod
     def _entity_from_row(row):
@@ -140,6 +150,89 @@ class SQLiteRepository:
             connection.close()
         return self.get_entity(entity_id)
 
+    def apply_transition(
+        self,
+        entity_id,
+        expected_version,
+        allowed_statuses,
+        next_status,
+        data,
+        audit,
+        idempotency=None,
+    ):
+        """Conditionally apply a transition, writing audit and idempotency rows in the same tx.
+
+        The WHERE clause guards both version and source status, so two operators racing
+        on the same release can never both win: the first commit claims it, the second
+        matches zero rows and gets a ConflictError.
+        """
+        now = utcnow()
+        payload = json.dumps(data, ensure_ascii=False, sort_keys=True)
+        placeholders = ", ".join("?" for _ in allowed_statuses)
+        connection = self._connect()
+        try:
+            connection.execute("BEGIN IMMEDIATE")
+            row = connection.execute(
+                "SELECT id, status, version FROM entities WHERE id = ?", (entity_id,)
+            ).fetchone()
+            if not row:
+                raise NotFoundError("entity not found: " + entity_id)
+            if expected_version is not None and int(row["version"]) != int(expected_version):
+                raise ConflictError(
+                    "version conflict: expected %s, found %s"
+                    % (expected_version, row["version"])
+                )
+            cursor = connection.execute(
+                "UPDATE entities SET status = ?, version = version + 1, data = ?, updated_at = ? "
+                "WHERE id = ? AND version = ? AND status IN (" + placeholders + ")",
+                (
+                    next_status,
+                    payload,
+                    now,
+                    entity_id,
+                    int(row["version"]),
+                    *allowed_statuses,
+                ),
+            )
+            if cursor.rowcount == 0:
+                raise ConflictError(
+                    "transition already applied to %s; only the first submission is accepted"
+                    % entity_id
+                )
+            connection.execute(
+                "INSERT INTO audit_log(entity_id, actor_id, actor_role, action, from_status, "
+                "to_status, detail, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                (
+                    entity_id,
+                    audit["actor_id"],
+                    audit["actor_role"],
+                    audit["action"],
+                    audit["from_status"],
+                    audit["to_status"],
+                    json.dumps(audit["detail"], ensure_ascii=False, sort_keys=True),
+                    now,
+                ),
+            )
+            if idempotency:
+                connection.execute(
+                    "INSERT OR REPLACE INTO idempotency(actor_id, idem_key, entity_id, action, created_at) "
+                    "VALUES (?, ?, ?, ?, ?)",
+                    (
+                        idempotency["actor_id"],
+                        idempotency["idem_key"],
+                        entity_id,
+                        idempotency["action"],
+                        now,
+                    ),
+                )
+            connection.commit()
+        except Exception:
+            connection.rollback()
+            raise
+        finally:
+            connection.close()
+        return self.get_entity(entity_id)
+
     def append_audit(self, entity_id, actor_id, actor_role, action, from_status, to_status, detail):
         with self._connect() as connection:
             connection.execute(
@@ -188,12 +281,22 @@ class SQLiteRepository:
             ).fetchone()
         return row["entity_id"] if row else None
 
-    def save_idempotency(self, actor_id, idem_key, entity_id):
+    def get_idempotency_record(self, actor_id, idem_key):
+        with self._connect() as connection:
+            row = connection.execute(
+                "SELECT entity_id, action FROM idempotency WHERE actor_id = ? AND idem_key = ?",
+                (actor_id, idem_key),
+            ).fetchone()
+        if not row:
+            return None
+        return {"entity_id": row["entity_id"], "action": row["action"]}
+
+    def save_idempotency(self, actor_id, idem_key, entity_id, action="create"):
         with self._connect() as connection:
             connection.execute(
-                "INSERT OR REPLACE INTO idempotency(actor_id, idem_key, entity_id, created_at) "
-                "VALUES (?, ?, ?, ?)",
-                (actor_id, idem_key, entity_id, utcnow()),
+                "INSERT OR REPLACE INTO idempotency(actor_id, idem_key, entity_id, action, created_at) "
+                "VALUES (?, ?, ?, ?, ?)",
+                (actor_id, idem_key, entity_id, action, utcnow()),
             )
 
     def ping(self):

@@ -37,6 +37,12 @@ class FailureTest(unittest.TestCase):
             "instrument",
             {"name": "I", "serial": "S", "calibration_due": "2099-01-01"},
         )
+        instrument = self.service.transition(
+            self.supervisor,
+            instrument["id"],
+            "calibrate",
+            {"calibration_due": "2099-01-01", "certificate_id": "CERT-1", "calibrated_at": "2026-09-27T07:00:00Z"},
+        )
         run = self.service.create(
             self.supervisor,
             "qc_run",

@@ -93,7 +93,11 @@ def create_handler(service, rules, static_dir):
                         return self._send(200, service.get(parts[2]))
                     query = parse_qs(parsed.query)
                     status = query.get("status", [None])[0]
-                    return self._send(200, {"items": service.list(parts[1], status=status)})
+                    basis_status = query.get("basis_status", [None])[0]
+                    return self._send(
+                        200,
+                        {"items": service.list(parts[1], status=status, basis_status=basis_status)},
+                    )
                 raise NotFoundError("not found")
             except Exception as exc:
                 self._fail(exc)
@@ -116,6 +120,7 @@ def create_handler(service, rules, static_dir):
                             action,
                             body.pop("data", body),
                             body.pop("expected_version", None),
+                            idempotency_key=self.headers.get("Idempotency-Key"),
                         ),
                     )
                 if len(parts) == 4 and parts[0] == "api" and parts[3] == "actions":
@@ -131,13 +136,27 @@ def create_handler(service, rules, static_dir):
                             action,
                             body.pop("data", body),
                             body.pop("expected_version", None),
+                            idempotency_key=self.headers.get("Idempotency-Key"),
                         ),
                     )
                 if len(parts) == 5 and parts[0] == "api" and parts[4] == "actions":
                     return self._send(
                         200,
-                        service.transition(actor, parts[2], parts[3], self._body(), None),
+                        service.transition(
+                            actor,
+                            parts[2],
+                            parts[3],
+                            self._body(),
+                            None,
+                            idempotency_key=self.headers.get("Idempotency-Key"),
+                        ),
                     )
+                if len(parts) == 3 and parts[0] == "api" and parts[2] == "backfill":
+                    self._body()
+                    return self._send(200, service.backfill_release_basis(actor))
+                if len(parts) == 4 and parts[0] == "api" and parts[3] == "backfill":
+                    self._body()
+                    return self._send(200, service.backfill_release_basis(actor, parts[2]))
                 if len(parts) == 2 and parts[0] == "api":
                     body = self._body()
                     return self._send(

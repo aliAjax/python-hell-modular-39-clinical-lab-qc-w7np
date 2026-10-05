@@ -43,6 +43,12 @@ class WorkflowTest(unittest.TestCase):
             "instrument",
             {"name": "Analyzer A", "serial": "A-100", "calibration_due": "2099-01-01"},
         )
+        instrument = self.service.transition(
+            self.supervisor,
+            instrument["id"],
+            "calibrate",
+            {"calibration_due": "2099-01-01", "certificate_id": "CERT-1", "calibrated_at": "2026-09-27T07:00:00Z"},
+        )
         return assay, lot, instrument
 
     def test_qc_accept_and_result_release(self):
