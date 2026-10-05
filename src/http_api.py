@@ -103,6 +103,8 @@ def create_handler(service, rules, static_dir):
                 parsed = urlparse(self.path)
                 parts = [part for part in parsed.path.split("/") if part]
                 actor = self._actor()
+                if parsed.path == "/api/backfill_basis":
+                    return self._send(200, service.backfill_basis(actor))
                 if len(parts) == 3 and parts[:2] == ["api", "entities"]:
                     body = self._body()
                     action = body.pop("action", None)

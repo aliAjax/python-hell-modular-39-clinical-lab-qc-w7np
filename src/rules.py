@@ -1,4 +1,5 @@
 from .domain import ConflictError, InvalidTransition, PermissionDenied, ValidationError
+from .repository import utcnow
 
 
 def _find_one(lookup, kind, field, value):
@@ -70,8 +71,35 @@ def _validate_assay(actor, data, lookup):
         raise ValidationError("allowed_low and allowed_high must be numeric")
     if low >= high:
         raise ValidationError("allowed_low must be less than allowed_high")
+    rule_config = dict(data.get("rule_config") or {})
     return {
-        "rule_config": dict(data.get("rule_config") or {}),
+        "rule_config": rule_config,
+        "rule_version": 1,
+        "rule_history": [
+            {"version": 1, "rule_config": rule_config, "changed_at": utcnow()},
+        ],
+    }
+
+
+def _validate_update_rules(actor, entity, data, lookup):
+    try:
+        rule_config = dict(data["rule_config"])
+    except (KeyError, TypeError):
+        raise ValidationError("rule_config is required")
+    try:
+        for key in ("limit_sd", "consecutive_n", "consecutive_sd", "trend_n"):
+            if key in rule_config:
+                float(rule_config[key])
+    except (TypeError, ValueError):
+        raise ValidationError("rule_config values must be numeric")
+    current_version = int(entity["data"].get("rule_version", 1))
+    next_version = current_version + 1
+    history = list(entity["data"].get("rule_history") or [])
+    history.append({"version": next_version, "rule_config": rule_config, "changed_at": utcnow()})
+    return {
+        "rule_config": rule_config,
+        "rule_version": next_version,
+        "rule_history": history,
     }
 
 
@@ -94,7 +122,38 @@ def _validate_qc_lot(actor, data, lookup):
 def _validate_instrument(actor, data, lookup):
     if not str(data.get("serial", "")).strip():
         raise ValidationError("instrument serial is required")
-    return {"calibration_due": data.get("calibration_due")}
+    calibration_due = data.get("calibration_due")
+    return {
+        "calibration_due": calibration_due,
+        "certificate_id": data.get("certificate_id"),
+        "calibration_history": [
+            {
+                "certificate_id": data.get("certificate_id"),
+                "calibration_due": calibration_due,
+                "calibrated_at": utcnow(),
+            },
+        ],
+    }
+
+
+def _validate_calibrate(actor, entity, data, lookup):
+    certificate_id = data.get("certificate_id")
+    calibration_due = data.get("calibration_due")
+    if not certificate_id or not calibration_due:
+        raise ValidationError("certificate_id and calibration_due are required")
+    history = list(entity["data"].get("calibration_history") or [])
+    history.append(
+        {
+            "certificate_id": certificate_id,
+            "calibration_due": calibration_due,
+            "calibrated_at": utcnow(),
+        }
+    )
+    return {
+        "certificate_id": certificate_id,
+        "calibration_due": calibration_due,
+        "calibration_history": history,
+    }
 
 
 def _validate_qc_run(actor, data, lookup):
@@ -165,7 +224,87 @@ def _validate_release(actor, entity, data, lookup):
             active_holds.append(batch)
     if active_holds:
         raise ConflictError("an intercepted result batch must be resolved first")
-    return {"released_by": actor.user_id}
+    assay = _find_one(lookup, "assay", "id", entity["data"].get("assay_id"))
+    lot = _find_one(lookup, "qc_lot", "id", run["data"].get("qc_lot_id"))
+    basis = {
+        "qc_lot": {
+            "id": lot["id"] if lot else None,
+            "lot_no": lot["data"].get("lot_no") if lot else None,
+            "target": lot["data"].get("target") if lot else None,
+            "sd": lot["data"].get("sd") if lot else None,
+        },
+        "calibration": {
+            "certificate_id": instrument["data"].get("certificate_id"),
+            "calibration_due": instrument["data"].get("calibration_due"),
+        },
+        "rules": {
+            "rule_version": int(assay["data"].get("rule_version", 1)) if assay else 1,
+            "rule_config": dict(assay["data"].get("rule_config") or {}) if assay else {},
+        },
+        "released_at": utcnow(),
+    }
+    return {"released_by": actor.user_id, "release_basis": basis, "review_status": "complete"}
+
+
+def _validate_recalculate(actor, entity, data, lookup):
+    instrument = _find_one(lookup, "instrument", "id", entity["data"].get("instrument_id"))
+    if not instrument or instrument["status"] != "ready":
+        raise ConflictError("instrument is not ready for recalculation")
+    if not calibration_is_valid(instrument["data"].get("calibration_due"), utcnow()):
+        raise ConflictError("instrument calibration is not currently valid")
+    assay = _find_one(lookup, "assay", "id", entity["data"].get("assay_id"))
+    if not assay:
+        raise ConflictError("assay record disappeared")
+    active_lot = None
+    for lot in lookup("qc_lot", "assay_id", assay["id"]) or []:
+        if lot["status"] == "active":
+            active_lot = lot
+            break
+    if not active_lot:
+        raise ConflictError("no active QC lot for the assay")
+    accepted_run = None
+    for run in lookup("qc_run", "instrument_id", entity["data"].get("instrument_id")) or []:
+        if run["status"] != "accepted":
+            continue
+        if run["data"].get("assay_id") != assay["id"]:
+            continue
+        if run["data"].get("qc_lot_id") != active_lot["id"]:
+            continue
+        accepted_run = run
+        break
+    if not accepted_run:
+        raise ConflictError("no accepted QC run under the current active lot")
+    previous_basis = entity["data"].get("release_basis")
+    history = list(entity["data"].get("basis_history") or [])
+    if previous_basis:
+        history.append(previous_basis)
+    basis = {
+        "qc_lot": {
+            "id": active_lot["id"],
+            "lot_no": active_lot["data"].get("lot_no"),
+            "target": active_lot["data"].get("target"),
+            "sd": active_lot["data"].get("sd"),
+        },
+        "calibration": {
+            "certificate_id": instrument["data"].get("certificate_id"),
+            "calibration_due": instrument["data"].get("calibration_due"),
+        },
+        "rules": {
+            "rule_version": int(assay["data"].get("rule_version", 1)),
+            "rule_config": dict(assay["data"].get("rule_config") or {}),
+        },
+        "released_at": utcnow(),
+        "recalculated_from": entity["id"],
+    }
+    return {
+        "release_basis": basis,
+        "basis_history": history,
+        "affected_by": None,
+        "affected_reason": None,
+        "affected_at": None,
+        "review_status": "complete",
+        "_next_status": "released",
+    }
 
 
 def _validate_qc_retest(actor, entity, data, lookup):
@@ -213,6 +352,7 @@ class RuleEngine:
         "assay": {
             "suspend": (("active",), "suspended"),
             "restore": (("suspended",), "active"),
+            "update_rules": (("active",), "active"),
         },
         "qc_lot": {
             "activate": (("registered", "suspended"), "active"),
@@ -239,7 +379,8 @@ class RuleEngine:
             "retest": (("intercepted",), "waiting"),
             "investigate": (("intercepted",), "investigating"),
             "resolve": (("investigating",), "resolved"),
-            "correct": (("waiting", "intercepted", "investigating", "released", "resolved"), "waiting"),
+            "recalculate": (("affected",), "released"),
+            "correct": (("waiting", "intercepted", "investigating", "released", "resolved", "affected"), "waiting"),
         },
     }
     CREATE_REQUIRED = {
@@ -251,6 +392,7 @@ class RuleEngine:
     }
     ACTION_REQUIRED = {
         ("assay", "suspend"): ("reason",),
+        ("assay", "update_rules"): ("rule_config",),
         ("qc_lot", "switch_in"): ("previous_lot_id", "switched_at"),
         ("qc_lot", "suspend"): ("reason",),
         ("qc_lot", "retire"): ("reason",),
@@ -279,6 +421,7 @@ class RuleEngine:
     ROLE_ACTIONS = {
         "suspend": ("supervisor", "admin"),
         "restore": ("supervisor", "admin"),
+        "update_rules": ("supervisor", "admin"),
         "activate": ("supervisor", "admin"),
         "switch_in": ("supervisor", "admin"),
         "retire": ("supervisor", "admin"),
@@ -291,6 +434,7 @@ class RuleEngine:
         "resolve": ("supervisor", "admin"),
         "correct": ("supervisor", "admin"),
         "release": ("supervisor", "admin"),
+        "recalculate": ("supervisor", "admin"),
         "intercept": ("operator", "supervisor", "admin"),
     }
     CUSTOM_CREATE = {
@@ -303,10 +447,13 @@ class RuleEngine:
     CUSTOM_TRANSITIONS = {
         ("qc_run", "evaluate"): _validate_evaluate,
         ("result_batch", "release"): _validate_release,
+        ("result_batch", "recalculate"): _validate_recalculate,
         ("result_batch", "retest"): _validate_qc_retest,
         ("qc_lot", "switch_in"): _validate_switch_lot,
         ("qc_run", "correct"): _validate_correct,
         ("result_batch", "correct"): _validate_correct,
+        ("assay", "update_rules"): _validate_update_rules,
+        ("instrument", "calibrate"): _validate_calibrate,
     }
 
     def normalize_kind(self, kind):
